@@ -108,7 +108,7 @@ class HierarchicalStateSpaceModel(nn.Module):
 
         # probability
         log_sample_alpha = log_sample_alpha - torch.logsumexp(log_sample_alpha, dim=-1, keepdim=True)
-        sample_prob = log_sample_alpha.exp()
+        sample_prob = log_sample_alpha.exp() # probability of a categorical sample
         sample_data = torch.eye(2, dtype=log_alpha.dtype, device=log_alpha.device)[torch.max(sample_prob, dim=-1)[1]]
 
         # sample with rounding and st-estimator
@@ -187,18 +187,18 @@ class HierarchicalStateSpaceModel(nn.Module):
         #######################
         # observation encoder #
         #######################
-        enc_obs_list = self.enc_obs(obs_data_list.view(-1, *obs_data_list.size()[2:]))
+        enc_obs_list = self.enc_obs(obs_data_list.view(-1, *obs_data_list.size()[2:])) # encodes each obs
         enc_obs_list = enc_obs_list.view(num_samples, full_seq_size, -1)
 
         ######################
         # boundary sampling ##
         ######################
-        post_boundary_log_alpha_list = self.post_boundary(enc_obs_list)
+        post_boundary_log_alpha_list = self.post_boundary(enc_obs_list) # log_probs for each encoded observation using Conv1D of adjacent neighbors output Shape: (N, Length, Feat_Size)
         boundary_data_list, post_boundary_sample_logit_list = self.boundary_sampler(post_boundary_log_alpha_list)
-        boundary_data_list[:, :(init_size + 1), 0] = 1.0
-        boundary_data_list[:, :(init_size + 1), 1] = 0.0
-        boundary_data_list[:, -init_size:, 0] = 1.0
-        boundary_data_list[:, -init_size:, 1] = 0.0
+        boundary_data_list[:, :(init_size + 1), 0] = 1.0  # all states up until init_size + 1 are gonna be update operation 
+        boundary_data_list[:, :(init_size + 1), 1] = 0.0  # don't copy init 
+        boundary_data_list[:, -init_size:, 0] = 1.0 # all states in the last init_size length are update operation 
+        boundary_data_list[:, -init_size:, 1] = 0.0 # don't copy init
 
         ######################
         # posterior encoding #
@@ -206,14 +206,14 @@ class HierarchicalStateSpaceModel(nn.Module):
         abs_post_fwd_list = []
         abs_post_bwd_list = []
         obs_post_fwd_list = []
-        abs_post_fwd = obs_data_list.new_zeros(num_samples, self.abs_belief_size)
-        abs_post_bwd = obs_data_list.new_zeros(num_samples, self.abs_belief_size)
-        obs_post_fwd = obs_data_list.new_zeros(num_samples, self.obs_belief_size)
+        abs_post_fwd = obs_data_list.new_zeros(num_samples, self.abs_belief_size) # hidden state of forward z RNN
+        abs_post_bwd = obs_data_list.new_zeros(num_samples, self.abs_belief_size) # hidden state of bwd z RNN
+        obs_post_fwd = obs_data_list.new_zeros(num_samples, self.obs_belief_size) # hidden state of observation RNN
         for fwd_t, bwd_t in zip(range(full_seq_size), reversed(range(full_seq_size))):
             # forward encoding
             fwd_copy_data = boundary_data_list[:, fwd_t, 1].unsqueeze(-1)
-            abs_post_fwd = self.abs_post_fwd(enc_obs_list[:, fwd_t], abs_post_fwd)
-            obs_post_fwd = self.obs_post_fwd(enc_obs_list[:, fwd_t], fwd_copy_data * obs_post_fwd)
+            abs_post_fwd = self.abs_post_fwd(enc_obs_list[:, fwd_t], abs_post_fwd) # RNN forward of z with initially zeros as hidden state
+            obs_post_fwd = self.obs_post_fwd(enc_obs_list[:, fwd_t], fwd_copy_data * obs_post_fwd) 
             abs_post_fwd_list.append(abs_post_fwd)
             obs_post_fwd_list.append(obs_post_fwd)
 
@@ -221,7 +221,7 @@ class HierarchicalStateSpaceModel(nn.Module):
             bwd_copy_data = boundary_data_list[:, bwd_t, 1].unsqueeze(-1)
             abs_post_bwd = self.abs_post_bwd(enc_obs_list[:, bwd_t], abs_post_bwd)
             abs_post_bwd_list.append(abs_post_bwd)
-            abs_post_bwd = bwd_copy_data * abs_post_bwd
+            abs_post_bwd = bwd_copy_data * abs_post_bwd # if copy = 0, we are resetting the backward z hidden state
         abs_post_bwd_list = abs_post_bwd_list[::-1]
 
         #############
@@ -245,7 +245,7 @@ class HierarchicalStateSpaceModel(nn.Module):
         ######################
         # forward transition #
         ######################
-        for t in range(init_size, init_size + seq_size):
+        for t in range(init_size, init_size + seq_size): # only loop over part that needs to be reconstructed
             #####################
             # (0) get mask data #
             #####################
@@ -256,22 +256,22 @@ class HierarchicalStateSpaceModel(nn.Module):
             # (1) sample abstract state #
             #############################
             if t == init_size:
-                abs_belief = self.init_abs_belief(abs_post_fwd_list[t - 1])
+                abs_belief = self.init_abs_belief(abs_post_fwd_list[t - 1]) # initial abstract is just estimated z features from last init time_step
             else:
-                abs_belief = read_data * self.update_abs_belief(abs_state, abs_belief) + copy_data * abs_belief
-            prior_abs_state = self.prior_abs_state(abs_belief)
-            post_abs_state = self.post_abs_state(concat(abs_post_fwd_list[t - 1], abs_post_bwd_list[t]))
-            abs_state = read_data * post_abs_state.rsample() + copy_data * abs_state
-            abs_feat = self.abs_feat(concat(abs_belief, abs_state))
+                abs_belief = read_data * self.update_abs_belief(abs_state, abs_belief) + copy_data * abs_belief # if read = 1, we update/resample abs belief, otherwise copy = 1 and we just copy previous z
+            prior_abs_state = self.prior_abs_state(abs_belief) # Gaussian based on belief (RNN hidden state) of z
+            post_abs_state = self.post_abs_state(concat(abs_post_fwd_list[t - 1], abs_post_bwd_list[t])) # concat hidden state all things up to t-1 and all things from t forward
+            abs_state = read_data * post_abs_state.rsample() + copy_data * abs_state # update true abs_state by sampling post_abs_state (figure 2a) if needed
+            abs_feat = self.abs_feat(concat(abs_belief, abs_state)) # extract features of z
 
             ################################
             # (2) sample observation state #
             ################################
-            obs_belief = read_data * self.init_obs_belief(abs_feat) + copy_data * self.update_obs_belief(concat(obs_state, abs_feat), obs_belief)
-            prior_obs_state = self.prior_obs_state(obs_belief)
-            post_obs_state = self.post_obs_state(concat(obs_post_fwd_list[t], abs_feat))
+            obs_belief = read_data * self.init_obs_belief(abs_feat) + copy_data * self.update_obs_belief(concat(obs_state, abs_feat), obs_belief) # if read = 1, update/resample s_t, otherwise, update s_t based on z and previous s_{t-1}
+            prior_obs_state = self.prior_obs_state(obs_belief) # Gaussian based on belief (RNN hidden state) of obs
+            post_obs_state = self.post_obs_state(concat(obs_post_fwd_list[t], abs_feat)) # Gaussian based on previous states and features of current z
             obs_state = post_obs_state.rsample()
-            obs_feat = self.obs_feat(concat(obs_belief, obs_state))
+            obs_feat = self.obs_feat(concat(obs_belief, obs_state)) # encoding of features of observation
 
             ##########################
             # (3) decode observation #
@@ -281,7 +281,7 @@ class HierarchicalStateSpaceModel(nn.Module):
             ##################
             # (4) mask prior #
             ##################
-            prior_boundary_log_alpha = self.prior_boundary(obs_feat)
+            prior_boundary_log_alpha = self.prior_boundary(obs_feat) # prior based on observation feature encodings
 
             ############
             # (5) save #
@@ -307,7 +307,7 @@ class HierarchicalStateSpaceModel(nn.Module):
 
         # fix prior by constraints
         prior_boundary_log_alpha_list = self.regularize_prior_boundary(prior_boundary_log_alpha_list,
-                                                                       boundary_data_list)
+                                                                       boundary_data_list) # fix boundaries if too many segments or some segments too long
 
         # compute log-density
         prior_boundary_log_density = log_density_concrete(prior_boundary_log_alpha_list,
@@ -338,6 +338,7 @@ class HierarchicalStateSpaceModel(nn.Module):
 
     # generation forward
     def jumpy_generation(self, init_data_list, seq_size):
+        # Assumes that a boundary is sampled at every timestep
         # eval mode
         self.eval()
 
@@ -415,7 +416,7 @@ class HierarchicalStateSpaceModel(nn.Module):
         ####################
         abs_post_fwd = init_data_list.new_zeros(num_samples, self.abs_belief_size)
         for t in range(init_size):
-            abs_post_fwd = self.abs_post_fwd(self.enc_obs(init_data_list[:, t]), abs_post_fwd)
+            abs_post_fwd = self.abs_post_fwd(self.enc_obs(init_data_list[:, t]), abs_post_fwd) # encoding each timestep of obs given
 
         ##############
         # init state #
@@ -441,23 +442,23 @@ class HierarchicalStateSpaceModel(nn.Module):
             # (1) sample abstract state #
             #############################
             if t == 0:
-                abs_belief = self.init_abs_belief(abs_post_fwd)
+                abs_belief = self.init_abs_belief(abs_post_fwd) # identity of hidden state of z
             else:
                 abs_belief = read_data * self.update_abs_belief(abs_state, abs_belief) + copy_data * abs_belief
-            abs_state = read_data * self.prior_abs_state(abs_belief).rsample() + copy_data * abs_state
+            abs_state = read_data * self.prior_abs_state(abs_belief).rsample() + copy_data * abs_state # here we use prior instead of posterior b/c no backward encoding
             abs_feat = self.abs_feat(concat(abs_belief, abs_state))
 
             ################################
             # (2) sample observation state #
             ################################
             obs_belief = read_data * self.init_obs_belief(abs_feat) + copy_data * self.update_obs_belief(concat(obs_state, abs_feat), obs_belief)
-            obs_state = self.prior_obs_state(obs_belief).rsample()
-            obs_feat = self.obs_feat(concat(obs_belief, obs_state))
+            obs_state = self.prior_obs_state(obs_belief).rsample() # sample underlying observation state
+            obs_feat = self.obs_feat(concat(obs_belief, obs_state)) # create s from belief (composed from z) and a sample 
 
             ##########################
             # (3) decode observation #
             ##########################
-            obs_rec = self.dec_obs(obs_feat)
+            obs_rec = self.dec_obs(obs_feat) # reconstruct x from s
 
             ############
             # (4) save #
@@ -468,7 +469,7 @@ class HierarchicalStateSpaceModel(nn.Module):
             ###################
             # (5) sample mask #
             ###################
-            prior_boundary = self.boundary_sampler(self.prior_boundary(obs_feat))[0]
+            prior_boundary = self.boundary_sampler(self.prior_boundary(obs_feat))[0] # sample a new boundary given the current obs
             read_data = prior_boundary[:, 0].unsqueeze(-1)
             copy_data = prior_boundary[:, 1].unsqueeze(-1)
 
